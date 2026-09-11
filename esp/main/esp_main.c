@@ -19,6 +19,9 @@
 #include "../../ini.h"
 #include "../../pc.h"
 #include "common.h"
+#include "../../i8042.h"
+#include "driver/adc.h"
+#include "driver/i2c.h"
 
 //
 #include "esp_private/system_internal.h"
@@ -166,7 +169,84 @@ static int pc_main(const char *file)
 	return 0;
 }
 
-//
+// НАСТРОЙКА МЫШКИ, ДЖОЙСТИКА И КЛАВИАТУРЫ
+#define I2C_MASTER_NUM              I2C_NUM_0  
+#define CARDKB_I2C_ADDR             0x5F       
+
+#define PIN_BUTTON_LEFT             10  // Левая кнопка мыши (клик)
+#define PIN_BUTTON_RIGHT            11  // Правая кнопка мыши (клик)
+#define PIN_JOYSTICK_X              4   // Ось X джойстика
+#define PIN_JOYSTICK_Y              5   // Ось Y джойстика
+
+void cardkb_task(void *pvParameters) {
+    uint8_t asc_code;
+    uint8_t last_scancode = 0;
+
+    // 1. Настройка кнопок клика
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_BUTTON_LEFT) | (1ULL << PIN_BUTTON_RIGHT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULL_UP_ENABLE,
+        .pull_down_en = GPIO_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    // 2. Настройка аналоговых входов для джойстика
+    gpio_set_direction(PIN_JOYSTICK_X, GPIO_MODE_INPUT);
+    gpio_set_direction(PIN_JOYSTICK_Y, GPIO_MODE_INPUT);
+
+    while (1) {
+        // --- 1. ОБРАБОТКА МЫШКИ И ДЖОЙСТИКА ---
+        if (globals.mouse) {
+            bool left_click = (gpio_get_level(PIN_BUTTON_LEFT) == 0);
+            bool right_click = (gpio_get_level(PIN_BUTTON_RIGHT) == 0);
+
+            globals.mouse->button_state = (left_click ? 1 : 0) | (right_click ? 2 : 0);
+            
+            int raw_x = adc1_get_raw(ADC1_CHANNEL_4); 
+            int raw_y = adc1_get_raw(ADC1_CHANNEL_5); 
+
+            int dx = 0;
+            int dy = 0;
+            
+            if (raw_x > 2200 || raw_x < 1900) dx = (raw_x - 2048) / 150;
+            if (raw_y > 2200 || raw_y < 1900) dy = (raw_y - 2048) / 150;
+
+            if (dx != 0 || dy != 0) {
+                mouse_move_relative(dx, dy); 
+            }
+        }
+
+        // --- 2. ОБРАБОТКА КЛАВИАТУРЫ CARDKB ---
+        if (last_scancode != 0) {
+            i8042_write_data(last_scancode | 0x80); 
+            last_scancode = 0;
+            vTaskDelay(pdMS_TO_TICKS(20)); 
+        }
+
+        esp_err_t ret = i2c_master_read_from_device(I2C_MASTER_NUM, CARDKB_I2C_ADDR, &asc_code, 1, pdMS_TO_TICKS(30));
+        
+        if (ret == ESP_OK && asc_code != 0) {
+            uint8_t scancode = 0;
+            if (asc_code >= 'a' && asc_code <= 'z') {
+                static const uint8_t map[] = { 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C };
+                scancode = map[asc_code - 'a'];
+            } else if (asc_code >= '0' && asc_code <= '9') {
+                static const uint8_t map_num[] = { 0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A };
+                scancode = map_num[asc_code - '0'];
+            } else if (asc_code == 0x0D) { scancode = 0x1C; } 
+            else if (asc_code == 0x08) { scancode = 0x0E; } 
+            else if (asc_code == 0x20) { scancode = 0x39; } 
+
+            if (scancode != 0) {
+                i8042_write_data(scancode); 
+                last_scancode = scancode;   
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(40)); 
+    }
+}
 
 void *esp_psram_get(size_t *size);
 void vga_task(void *arg);
@@ -187,8 +267,6 @@ static void i386_task(void *arg)
 	struct esp_ini_config *config = arg;
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "main runs on core %d\n", core_id);
-	/* Wait for LCD panel (and panel_fb) to be ready before starting the
-	 * PC emulator.  console_init() uses globals.panel_fb if set. */
 	xEventGroupWaitBits(global_event_group,
 	                    BIT1,
 	                    pdFALSE,
@@ -225,7 +303,7 @@ void *fbmalloc(long size)
 }
 
 static int parse_ini(void* user, const char* section,
-		     const char* name, const char* value)
+		     const char[name], const char* value)
 {
 	struct esp_ini_config *conf = user;
 #define SEC(a) (strcmp(section, a) == 0)
@@ -271,11 +349,10 @@ void app_main(void)
 
 	esp_psram_init();
 #ifndef PSRAM_ALLOC_LEN
-	// use the whole psram
 	size_t len;
 	psram = esp_psram_get(&len);
 	psram_len = len;
-#else
+#define PSRAM_ALLOC_LEN
 	psram_len = PSRAM_ALLOC_LEN;
 	psram = heap_caps_calloc(1, psram_len, MALLOC_CAP_SPIRAM);
 #endif
@@ -302,6 +379,8 @@ void app_main(void)
 		wifi_main(config.ssid, config.pass);
 	}
 
+	xTaskCreatePinnedToCore(cardkb_task, "cardkb_task", 3072, NULL, 5, NULL, 1);
+    
 	if (psram) {
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 4096, &config, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
