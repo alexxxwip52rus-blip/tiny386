@@ -1,44 +1,43 @@
-name: build
+name: Build Tiny386 Firmware
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
+    runs-on: ubuntu-latest
 
-    runs-on: ubuntu-26.04
+    container:
+      image: espressif/idf:release-v5.3
 
     steps:
-    - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
 
-    - name: apt get
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -qq git build-essential clang mingw-w64 libasound2-dev libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxv-dev --no-install-recommends
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3-pip python3-venv
 
-    - name: prepare
-      run: scripts/build.sh thirdparty
+      - name: Build with ESP-IDF
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          cd esp
+          idf.py set-target esp32s3
+          idf.py build
 
-    - name: build
-      run: scripts/build.sh tiny386
-
-    - name: esp-idf build
-      uses: espressif/esp-idf-ci-action@v1
-      with:
-        esp_idf_version: v5.2.2
-        target: esp32s3
-        command: scripts/build.sh patch_idf && scripts/build.sh esp
-
-    - name: esp-idf esp32p4 build
-      uses: espressif/esp-idf-ci-action@v1
-      with:
-        esp_idf_version: v6.0.3
-        target: esp32p4
-        command: scripts/build.sh patch_idf_60 && scripts/build.sh esp_p4
-
-    - name: release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        UPLOADTOOL_ISPRERELEASE: "true"
-      run: wget -c https://github.com/probonopd/uploadtool/raw/master/upload.sh && scripts/build.sh bundle && bash upload.sh tiny386.tar.xz
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny386-esp32s3-firmware
+          path: |
+            esp/build/bootloader/bootloader.bin
+            esp/build/partition_table/partition-table.bin
+            esp/build/tiny386.bin
